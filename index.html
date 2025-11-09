@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AR Christmas Tree Try-On Booth (Demo)</title>
+  <style>
+    :root{--bg:#0b1020}
+    body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial;background:var(--bg);color:#fff;display:flex;flex-direction:column;align-items:center;gap:12px;padding:18px}
+    .stage{position:relative;width:840px;max-width:95%;aspect-ratio:16/9;background:#111;border-radius:12px;overflow:hidden;box-shadow:0 8px 30px rgba(0,0,0,.6)}
+    video#cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+    canvas#overlay{position:absolute;inset:0;pointer-events:none}
+    .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    button{background:#fff;color:#111;border:0;padding:10px 14px;border-radius:8px;cursor:pointer;font-weight:600}
+    .small{padding:6px 10px;font-size:14px}
+    .brand{display:flex;gap:10px;align-items:center}
+    .tag{font-size:14px;opacity:.9}
+    .hint{font-size:13px;color:#cbd5e1}
+    .footer{max-width:840px;width:95%;display:flex;justify-content:space-between;align-items:center}
+    .share-btn{background:linear-gradient(90deg,#ff9a9e,#fad0c4);color:#111}
+    /* responsive */
+    @media (max-width:520px){body{padding:8px}.controls{justify-content:center}}
+  </style>
+</head>
+<body>
+  <div class="brand">
+    <h2>AR Christmas Tree Try-On Booth</h2>
+    <div class="tag">— "Shine Brighter Than the Star on the Tree."</div>
+  </div>
+
+  <div class="stage" id="stage">
+    <!-- background: virtual Christmas tree (static image) -->
+    <img id="treeBg" src="https://via.placeholder.com/800x450.png?text=Christmas+Tree+Background" alt="tree" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:0;opacity:0.95;filter:brightness(.9)"/>
+
+    <!-- live camera feed -->
+    <video id="cam" autoplay playsinline muted></video>
+    <!-- canvas for drawing jewelry, sparkles, UI overlays -->
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="controls">
+    <button id="startBtn">Start Camera</button>
+    <button id="switchBtn" class="small">Switch Jewelry</button>
+    <button id="recordBtn" class="small">Start Recording</button>
+    <button id="downloadBtn" class="small" disabled>Download Video</button>
+    <button id="snapBtn" class="small">Take Photo</button>
+    <div class="hint">Tip: Allow Camera → Try different jewelry → Share on Instagram</div>
+  </div>
+
+  <div class="footer">
+    <div class="hint">Dummy images used — replace in the <code>images/</code> folder.</div>
+    <div>
+      <a href="#" id="helpLink" style="color:#9fe8c9"></a>
+    </div>
+  </div>
+
+  <!-- model & libs: using TFJS + face-landmarks-detection model via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.5.0/dist/tf-core.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.5.0/dist/tf-backend-webgl.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@0.0.6/dist/face-landmarks-detection.min.js"></script>
+
+  <script>
+  // -----------------------------
+  // AR Christmas Try-On Booth Demo
+  // - Uses webcam + TF face-landmarks-detection
+  // - Renders jewelry overlays (earrings + necklace)
+  // - Renders simple sparkle effects reacting to jewellery presence
+  // -----------------------------
+
+  const video = document.getElementById('cam');
+  const canvas = document.getElementById('overlay');
+  const ctx = canvas.getContext('2d');
+  const startBtn = document.getElementById('startBtn');
+  const switchBtn = document.getElementById('switchBtn');
+  const recordBtn = document.getElementById('recordBtn');
+  const downloadBtn = document.getElementById('downloadBtn');
+  const snapBtn = document.getElementById('snapBtn');
+
+  // Dummy jewelry images (you will replace these with real assets in /images)
+  const IMAGES = [
+    {name:'Classic Set', necklace:'gold_necklaces14.png?text=Necklace', earringL:'gold_earrings9?text=E-L', earringR:'gold_earrings9?text=E-R'},
+    {name:'Festive Ruby', necklace:'gold_necklaces15.png?text=Ruby+Necklace', earringL:'gold_earrings3.png?text=Ruby-L', earringR:'gold_earrings3.png?text=Ruby-R'},
+    {name:'Golden Charm', necklace:'gold_necklaces16.png?text=Gold', earringL:'gold_earrings13?text=Gold-L', earringR:'gold_earrings13.png?text=Gold-R'}
+  ];
+
+  let currentIndex = 0;
+  let model = null;
+  let streaming = false;
+  let recorder = null;
+  let recordedBlobs = [];
+
+  // Preload jewelry images
+  const imgCache = {};
+  async function preloadImages(){
+    for(const set of IMAGES){
+      for(const key of ['necklace','earringL','earringR']){
+        const url = set[key];
+        if(!imgCache[url]){
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          img.src = url;
+          await new Promise((res)=>{img.onload = res; img.onerror = res});
+          imgCache[url] = img;
+        }
+      }
+    }
+  }
+
+  async function setupCamera(){
+    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1280},height:{ideal:720}}, audio:false});
+    video.srcObject = stream;
+    await video.play();
+    streaming = true;
+    // setup canvas size to match video display size
+    canvas.width = video.videoWidth || video.clientWidth;
+    canvas.height = video.videoHeight || video.clientHeight;
+  }
+
+  async function loadModel(){
+    // use MediaPipe face mesh through the TFJS wrapper
+    model = await faceLandmarksDetection.load(faceLandmarksDetection.SupportedPackages.mediapipeFacemesh);
+  }
+
+  function getAvg(points){
+    const s = points.reduce((acc,p)=>[acc[0]+p[0], acc[1]+p[1]], [0,0]);
+    return [s[0]/points.length, s[1]/points.length];
+  }
+
+  function drawSparkles(cx, cy, intensity=1){
+    // simple sparkle particle system
+    const count = Math.min(40, Math.round(8 + intensity*40));
+    for(let i=0;i<count;i++){
+      const r = Math.random()*6 + 2;
+      const x = cx + (Math.random()-0.5)*120;
+      const y = cy + (Math.random()-0.5)*80;
+      ctx.beginPath();
+      ctx.globalAlpha = 0.6*Math.random();
+      ctx.fillStyle = `rgba(255, 245, 200, ${0.6*Math.random()})`;
+      ctx.arc(x,y,r,0,Math.PI*2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  async function renderLoop(){
+    if(!streaming || !model) return requestAnimationFrame(renderLoop);
+
+    // draw background tree (already behind via img element) - we draw on canvas only overlays
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    // mirror correction: video is mirrored in display; landmarks model expects natural coords, but outputs in pixels relative to video
+    const predictions = await model.estimateFaces({input:video,returnTensors:false,predictIrises:false});
+
+    if(predictions && predictions.length>0){
+      const p = predictions[0];
+      // landmarks array: use points for ears/jaw/chin
+      const keypoints = p.scaledMesh; // array of [x,y,z]
+
+      // choose landmark indexes for left/right ear area and chin area
+      // Note: mediapipe facemesh landmarks indices approximate
+      const leftEarIdx = 234;  // approximate left ear location
+      const rightEarIdx = 454; // approximate right ear location
+      const chinPoints = [152, 200, 199, 175, 152]; // chin/jaw area
+
+      const leftEar = keypoints[leftEarIdx];
+      const rightEar = keypoints[rightEarIdx];
+      const chinAvg = getAvg(chinPoints.map(i=>[keypoints[i][0], keypoints[i][1]]));
+
+      // draw debug points (optional)
+      // ctx.fillStyle='rgba(0,255,200,0.6)'; ctx.fillRect(leftEar[0]-3,leftEar[1]-3,6,6);
+
+      // compute scale for earrings and necklace based on face width
+      const faceWidth = Math.hypot(rightEar[0]-leftEar[0], rightEar[1]-leftEar[1]);
+      const earringScale = faceWidth/4; // tuning param
+      const necklaceWidth = faceWidth*1.2;
+
+      // draw earrings
+      const eL = imgCache[IMAGES[currentIndex].earringL];
+      const eR = imgCache[IMAGES[currentIndex].earringR];
+      if(eL){
+        const w = earringScale;
+        const h = eL.height * (w / eL.width);
+        ctx.save();
+        ctx.translate(leftEar[0], leftEar[1]);
+        // mirror correction for drawing
+        ctx.scale(-1,1);
+        ctx.drawImage(eL, -w/2, -h/2, w, h);
+        ctx.restore();
+        drawSparkles(leftEar[0], leftEar[1], 0.7);
+      }
+      if(eR){
+        const w = earringScale;
+        const h = eR.height * (w / eR.width);
+        ctx.drawImage(eR, rightEar[0]-w/2, rightEar[1]-h/2, w, h);
+        drawSparkles(rightEar[0], rightEar[1], 0.7);
+      }
+
+      // draw necklace
+      const n = imgCache[IMAGES[currentIndex].necklace];
+      if(n){
+        const w = necklaceWidth;
+        const h = n.height * (w / n.width);
+        const nx = chinAvg[0] - w/2;
+        const ny = chinAvg[1] - h*0.2; // slightly above chin
+        ctx.globalAlpha = 0.98;
+        ctx.drawImage(n, nx, ny, w, h);
+        drawSparkles(nx + w/2, ny + h/3, 0.9);
+        ctx.globalAlpha = 1;
+      }
+
+      // overlay brand/tag + CTA
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.fillRect(10, canvas.height - 68, 360, 56);
+      ctx.fillStyle = '#fff';
+      ctx.font = '18px sans-serif';
+      ctx.fillText(IMAGES[currentIndex].name, 18, canvas.height - 38);
+      ctx.font = '13px sans-serif';
+      ctx.fillText('Shine Brighter Than the Star on the Tree', 18, canvas.height - 18);
+
+    } else {
+      // no face: show hint
+      ctx.fillStyle='rgba(255,255,255,0.08)';
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle='#fff'; ctx.font='20px sans-serif'; ctx.textAlign='center';
+      ctx.fillText('Place your face inside the frame to try jewelry', canvas.width/2, canvas.height/2);
+      ctx.textAlign='start';
+    }
+
+    requestAnimationFrame(renderLoop);
+  }
+
+  // ---------- Recording helpers ----------
+  function startRecording(){
+    recordedBlobs = [];
+    const stream = canvas.captureStream(30); // record overlays+video? canvas only here
+    // to include the video + background, we could composite onto canvas (we already are overlaying), so canvas capture is fine.
+
+    try{
+      recorder = new MediaRecorder(stream, {mimeType:'video/webm;codecs=vp9'});
+    }catch(e){
+      recorder = new MediaRecorder(stream);
+    }
+    recorder.ondataavailable = (e)=>{ if(e.data && e.data.size>0) recordedBlobs.push(e.data) };
+    recorder.onstop = ()=>{
+      const blob = new Blob(recordedBlobs, {type:'video/webm'});
+      downloadBtn.href = URL.createObjectURL(blob);
+      downloadBtn.download = 'ar-tryon-record.webm';
+      downloadBtn.disabled = false;
+    };
+    recorder.start();
+  }
+
+  function stopRecording(){
+    if(recorder && recorder.state!=='inactive') recorder.stop();
+  }
+
+  // ---------- UI actions ----------
+  startBtn.addEventListener('click', async ()=>{
+    startBtn.disabled = true; startBtn.textContent = 'Loading...';
+    await preloadImages();
+    await setupCamera();
+    await loadModel();
+    startBtn.style.display = 'none';
+    requestAnimationFrame(renderLoop);
+  });
+
+  switchBtn.addEventListener('click', ()=>{
+    currentIndex = (currentIndex+1) % IMAGES.length;
+    switchBtn.textContent = 'Jewelry: ' + IMAGES[currentIndex].name;
+  });
+
+  recordBtn.addEventListener('click', ()=>{
+    if(recordBtn.dataset.rec==='1'){
+      recordBtn.dataset.rec='0'; recordBtn.textContent='Start Recording';
+      stopRecording();
+    } else {
+      recordBtn.dataset.rec='1'; recordBtn.textContent='Stop Recording';
+      startRecording();
+    }
+  });
+
+  downloadBtn.addEventListener('click', ()=>{
+    // link will download
+  });
+
+  snapBtn.addEventListener('click', ()=>{
+    // snapshot: composite current canvas + video frame into an image
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width = canvas.width; outCanvas.height = canvas.height;
+    const outCtx = outCanvas.getContext('2d');
+    // draw background tree image (from DOM)
+    const treeImg = document.getElementById('treeBg');
+    outCtx.drawImage(treeImg, 0, 0, outCanvas.width, outCanvas.height);
+    // draw mirrored video (so final image looks natural)
+    outCtx.save(); outCtx.scale(-1,1); outCtx.drawImage(video, -outCanvas.width, 0, outCanvas.width, outCanvas.height); outCtx.restore();
+    // draw overlay canvas
+    outCtx.drawImage(canvas, 0, 0);
+    const data = outCanvas.toDataURL('image/png');
+    const a = document.createElement('a'); a.href = data; a.download='ar-tryon-photo.png'; a.click();
+  });
+
+  // help link opens quick developer notes
+  document.getElementById('helpLink').addEventListener('click', (e)=>{e.preventDefault(); alert('Developer notes:\n- Replace placeholder images in IMAGES array with your assets (hosted or relative).\n- For better accuracy, host high-res earring images with transparent background (PNG).\n- Tune landmark indices if needed.\n- To deploy: place this file (and assets) in a GitHub repository and enable GitHub pages.');});
+
+  // resize canvas on window change
+  window.addEventListener('resize', ()=>{
+    if(streaming){ canvas.width = video.videoWidth || video.clientWidth; canvas.height = video.videoHeight || video.clientHeight; }
+  });
+  </script>
+</body>
+</html>
